@@ -13,6 +13,7 @@ import subprocess
 import threading
 import queue
 import platform
+import webbrowser
 from pathlib import Path
 from uuid import uuid4
 
@@ -41,13 +42,13 @@ APP_TITLE   = "2004sp Launcher"
 APP_VERSION = "1.0.0"
 WIN_W, WIN_H = 1220, 800
 
-REPO_ENGINE      = "https://github.com/LostCityRS/Engine-TS.git"
-REPO_CONTENT     = "https://github.com/LostCityRS/Content.git"
-REPO_SERVER      = "https://github.com/LostCityRS/Server.git"
-REPO_PROGRESSIVE = "https://github.com/2004sp/2004sp-progressive.git"
-REPO_EXTRAS      = "https://github.com/2004sp/2004sp-extras.git"
-CLIENT_API       = "https://api.github.com/repos/2004sp/2004sp-client/releases/latest"
-JAVA_CLIENT_API  = "https://api.github.com/repos/2004sp/Progressive-Java-Client/releases/latest"
+REPO_ENGINE           = "https://github.com/LostCityRS/Engine-TS.git"
+REPO_CONTENT          = "https://github.com/LostCityRS/Content.git"
+REPO_SERVER           = "https://github.com/LostCityRS/Server.git"
+REPO_PROGRESSIVE      = "https://github.com/2004sp/2004sp-progressive.git"
+REPO_EXTRAS           = "https://github.com/2004sp/2004sp-extras.git"
+CLIENT_API            = "https://api.github.com/repos/2004sp/2004sp-client/releases/latest"
+PROGRESSIVE_BRANCHES_API = "https://api.github.com/repos/2004sp/2004sp-progressive/branches"
 
 INSTALL_DIR_DEFAULT = _launcher_dir() / "lostcity254"
 
@@ -92,15 +93,21 @@ LOG_LABELS = {
 
 _state_lock = threading.Lock()
 _state: dict = {
-    "install_dir":   INSTALL_DIR_DEFAULT,
-    "engine_dir":    None,
-    "running_procs": {},    # name -> subprocess.Popen
-    "dl_progress":   0.0,
+    "install_dir":       INSTALL_DIR_DEFAULT,
+    "engine_dir":        None,
+    "running_procs":     {},      # name -> subprocess.Popen
+    "dl_progress":       0.0,
+    "selected_branch":   "dev",
+    "available_branches": ["dev"],
 }
 
 _log_queue: queue.Queue = queue.Queue()
 _log_items: list = []
 MAX_LOG_LINES = 400
+
+# UI-update queue: background threads push (callable, args) tuples;
+# the render loop drains them on the main thread.
+_ui_updates: queue.Queue = queue.Queue()
 
 # Confirm-dialog system: background threads push requests; render loop creates modals.
 _confirm_queue: queue.Queue   = queue.Queue()
@@ -135,6 +142,18 @@ def flush_log() -> None:
 
     if changed:
         dpg.set_y_scroll("log_panel", dpg.get_y_scroll_max("log_panel"))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  UI-update queue (main-thread-safe deferred updates from background threads)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _drain_ui_updates() -> None:
+    while not _ui_updates.empty():
+        try:
+            fn, args = _ui_updates.get_nowait()
+            fn(*args)
+        except queue.Empty:
+            break
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Confirm dialog  (background-thread-safe Yes/No)
@@ -311,6 +330,107 @@ def get_engine_dir() -> Path | None:
     return None
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Branch detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _lostcity_branch(progressive_branch: str) -> str:
+    """Return the LostCity repo branch that matches the progressive branch name."""
+    if "274" in progressive_branch:
+        return "274"
+    return "254"
+
+def _fetch_progressive_branches() -> None:
+    """Fetch available branches from 2004sp-progressive and populate the combo."""
+    log("Fetching branches from 2004sp-progressive...", "step")
+    try:
+        r = requests.get(PROGRESSIVE_BRANCHES_API, timeout=15)
+        r.raise_for_status()
+        names = [b["name"] for b in r.json()]
+        if not names:
+            log("No branches returned — using fallback.", "warn")
+            names = ["dev", "main"]
+
+        def _sort_key(n: str):
+            nl = n.lower()
+            if "dev" in nl:
+                return (0, n)
+            if "main" in nl or "stable" in nl:
+                return (2, n)
+            return (1, n)
+
+        names.sort(key=_sort_key)
+        default = next((n for n in names if "dev" in n.lower()), names[0])
+
+        with _state_lock:
+            _state["available_branches"] = names
+            _state["selected_branch"]    = default
+
+        def _apply(branch_names, branch_default):
+            if dpg.does_item_exist("branch_combo"):
+                dpg.configure_item("branch_combo", items=branch_names,
+                                   default_value=branch_default)
+            log(f"Branches loaded — {len(branch_names)} found. Default: {branch_default}", "ok")
+
+        _ui_updates.put((_apply, (names, default)))
+
+    except Exception as e:
+        log(f"Could not fetch branches: {e}", "warn")
+        log("Falling back to dev / main.", "info")
+        with _state_lock:
+            _state["available_branches"] = ["dev", "main"]
+            _state["selected_branch"]    = "dev"
+
+        def _apply_fallback(branch_names, branch_default):
+            if dpg.does_item_exist("branch_combo"):
+                dpg.configure_item("branch_combo", items=branch_names,
+                                   default_value=branch_default)
+
+        _ui_updates.put((_apply_fallback, (["dev", "main"], "dev")))
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Client launcher
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _find_client_binary() -> Path | None:
+    """Return the first 2004sp client binary found in the install directory."""
+    install_dir = Path(_state["install_dir"])
+    system = platform.system().lower()
+    if "windows" in system:
+        patterns = ["*.exe", "*.msi"]
+        exclude  = {"uninstall", "setup"}
+    elif "darwin" in system:
+        patterns = ["*.dmg", "*.app"]
+        exclude  = set()
+    else:
+        patterns = ["*.AppImage", "*.deb"]
+        exclude  = set()
+
+    for pattern in patterns:
+        for p in install_dir.glob(pattern):
+            if not any(ex in p.name.lower() for ex in exclude):
+                return p
+    return None
+
+def op_launch_client() -> None:
+    binary = _find_client_binary()
+    if not binary:
+        log("No 2004sp client found in the install directory.", "warn")
+        log("Use Install → Install Client to download it first.", "info")
+        return
+    log(f"Launching: {binary.name}", "step")
+    try:
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(str(binary))
+        elif system == "Darwin":
+            subprocess.Popen(["open", str(binary)])
+        else:
+            subprocess.Popen([str(binary)])
+        log("Client launched.", "ok")
+    except Exception as e:
+        log(f"Could not launch client: {e}", "err")
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Installer operations
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -329,6 +449,9 @@ def _do_server_install(branch: str, install_dir: Path) -> bool:
         log("Prerequisites missing — aborting.", "err")
         return False
 
+    lc_branch = _lostcity_branch(branch)
+    log(f"Using LostCity branch: {lc_branch}", "info")
+
     install_dir.mkdir(parents=True, exist_ok=True)
 
     # Server root files
@@ -339,11 +462,11 @@ def _do_server_install(branch: str, install_dir: Path) -> bool:
                 overlay_files(server_tmp, install_dir)
                 shutil.rmtree(str(server_tmp), ignore_errors=True)
 
-    # Engine-TS (branch 254)
-    git_clone_or_pull(REPO_ENGINE, install_dir / "engine", branch="254")
+    # Engine-TS
+    git_clone_or_pull(REPO_ENGINE, install_dir / "engine", branch=lc_branch)
 
-    # Content (branch 254)
-    git_clone_or_pull(REPO_CONTENT, install_dir / "content", branch="254")
+    # Content
+    git_clone_or_pull(REPO_CONTENT, install_dir / "content", branch=lc_branch)
 
     # Progressive bots overlay
     prog_tmp = install_dir / "_progressive_tmp"
@@ -423,49 +546,6 @@ def _do_client_install(install_dir: Path) -> None:
     except Exception as e:
         log(f"Client download failed: {e}", "err")
 
-def _do_java_client_install(install_dir: Path) -> None:
-    log("── Downloading Progressive Java Client ──", "step")
-    log("NOTE: Java 17 or newer is required to run this client.", "warn")
-    try:
-        r = requests.get(JAVA_CLIENT_API, timeout=15)
-        r.raise_for_status()
-        assets = r.json().get("assets", [])
-
-        if not assets:
-            log("No assets found in the latest Java client release.", "warn")
-            log("https://github.com/2004sp/Progressive-Java-Client/releases", "info")
-            return
-
-        # Prefer .jar; fall back to first asset
-        asset = next((a for a in assets if a["name"].lower().endswith(".jar")), assets[0])
-        name = asset["name"]
-        url  = asset["browser_download_url"]
-        install_dir.mkdir(parents=True, exist_ok=True)
-        dest = install_dir / name
-
-        log(f"Downloading {name}...", "step")
-        dl    = requests.get(url, stream=True, timeout=120)
-        dl.raise_for_status()
-        total = int(dl.headers.get("content-length", 0))
-        done  = 0
-
-        with open(str(dest), "wb") as fh:
-            for chunk in dl.iter_content(65536):
-                fh.write(chunk)
-                done += len(chunk)
-                if total:
-                    with _state_lock:
-                        _state["dl_progress"] = done / total
-
-        with _state_lock:
-            _state["dl_progress"] = 1.0
-        log(f"Java client saved: {name}", "ok")
-        log("Run with:  java -jar " + name, "info")
-        log("Requires Java 17+  —  https://adoptium.net", "warn")
-
-    except Exception as e:
-        log(f"Java client download failed: {e}", "err")
-
 def op_install_server(branch: str) -> None:
     install_dir = Path(_state["install_dir"])
     log(f"── Install Server  branch={branch}  →  {install_dir} ──", "step")
@@ -476,9 +556,6 @@ def op_install_server(branch: str) -> None:
 
 def op_install_client() -> None:
     _do_client_install(Path(_state["install_dir"]))
-
-def op_install_java_client() -> None:
-    _do_java_client_install(Path(_state["install_dir"]))
 
 def _do_extra_content(install_dir: Path) -> None:
     log("── Extra Content ──", "step")
@@ -511,13 +588,6 @@ def op_install_all(branch: str) -> None:
     else:
         log("Skipping client install.", "info")
 
-    if _confirm("Download the Progressive Java Client?\n"
-                "Requires Java 17+  —  https://adoptium.net",
-                "Install Java Client"):
-        _do_java_client_install(install_dir)
-    else:
-        log("Skipping Java client install.", "info")
-
     if _confirm("Install Extra Content? (additional items, capes, etc.)",
                 "Extra Content"):
         _do_extra_content(install_dir)
@@ -528,7 +598,8 @@ def op_install_all(branch: str) -> None:
 
 def op_update_server(branch: str) -> None:
     install_dir = Path(_state["install_dir"])
-    log(f"── Update Server  branch={branch} ──", "step")
+    lc_branch   = _lostcity_branch(branch)
+    log(f"── Update Server  branch={branch}  lc={lc_branch} ──", "step")
 
     if not (install_dir / "engine" / ".git").exists():
         log("No existing install found. Run Install first.", "err")
@@ -572,13 +643,6 @@ def op_update_server(branch: str) -> None:
         _do_client_install(install_dir)
     else:
         log("Skipping client update.", "info")
-
-    if _confirm("Update the Progressive Java Client too?\n"
-                "Requires Java 17+  —  https://adoptium.net",
-                "Update Java Client"):
-        _do_java_client_install(install_dir)
-    else:
-        log("Skipping Java client update.", "info")
 
     if _confirm("Update Extra Content too?", "Update Extra Content"):
         _do_extra_content(install_dir)
@@ -846,6 +910,11 @@ def _btn(label: str, cb, w: int, theme: int) -> int:
     dpg.bind_item_theme(b, theme)
     return b
 
+def _link_btn(label: str, url: str, w: int, theme: int) -> int:
+    b = dpg.add_button(label=label, callback=lambda: webbrowser.open(url), width=w, height=36)
+    dpg.bind_item_theme(b, theme)
+    return b
+
 def _bg(fn, *args):
     """Fire and forget a function on a daemon thread."""
     threading.Thread(target=fn, args=args, daemon=True).start()
@@ -855,8 +924,16 @@ def _bg(fn, *args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _branch() -> str:
-    val = dpg.get_value("branch_radio")
-    return "main" if "main" in val.lower() or "stable" in val.lower() else "dev"
+    if dpg.does_item_exist("branch_combo"):
+        val = dpg.get_value("branch_combo")
+        if val:
+            return val
+    with _state_lock:
+        return _state.get("selected_branch", "dev")
+
+def _on_branch_change(sender, value: str) -> None:
+    with _state_lock:
+        _state["selected_branch"] = value
 
 def _on_dir_change(_, value: str) -> None:
     with _state_lock:
@@ -876,10 +953,8 @@ def _cb_clear_log() -> None:
 def _render() -> None:
     flush_log()
     _drain_confirm_queue()
+    _drain_ui_updates()
 
-    # Note: running_procs cleanup is handled by the _monitor thread only.
-    # Don't prune here — on Windows the shell wrapper may exit before the
-    # child node process does, which would cause premature removal.
     procs = _state["running_procs"]
 
     if dpg.does_item_exist("procs_status"):
@@ -945,7 +1020,7 @@ def build_ui() -> None:
                 dpg.add_spacer(height=5)
                 dpg.add_text(APP_TITLE, color=C_CYAN)
                 dpg.add_text(
-                    f"LostCity RS 254 + Progressive Bots  ·  v{APP_VERSION}",
+                    f"LostCity RS 254 + 2004sp  ·  v{APP_VERSION}",
                     color=C_DIM,
                 )
         dpg.add_separator()
@@ -1005,11 +1080,27 @@ def build_ui() -> None:
                         with dpg.child_window(width=content_w, height=TAB_CONTENT_H,
                                               border=False):
                             _section("Branch")
-                            dpg.add_radio_button(
-                                items=["Stable  (main)", "Dev  (dev)   ★ Recommended"],
-                                tag="branch_radio",
-                                default_value="Dev  (dev)   ★ Recommended",
-                                horizontal=True,
+                            with dpg.group(horizontal=True):
+                                dpg.add_combo(
+                                    tag="branch_combo",
+                                    items=["dev"],
+                                    default_value="dev",
+                                    width=240,
+                                    callback=_on_branch_change,
+                                )
+                                dpg.add_spacer(width=8)
+                                b_refresh = dpg.add_button(
+                                    label="↻  Refresh",
+                                    callback=lambda: _bg(_fetch_progressive_branches),
+                                    height=28,
+                                )
+                                dpg.bind_item_theme(b_refresh, t_cyan)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text(
+                                "Branches are fetched live from 2004sp-progressive. "
+                                "If a branch contains '274', the LostCity 274 base is used; "
+                                "otherwise 254.",
+                                color=C_DIM, wrap=content_w - 20,
                             )
 
                             _section("Install")
@@ -1023,26 +1114,21 @@ def build_ui() -> None:
                                      BTN_W, t_green)
                             dpg.add_spacer(height=4)
                             dpg.add_text(
-                                "Install All prompts you for client, Java client, and extra content.",
+                                "Install All prompts you for client and extra content.",
                                 color=C_DIM,
                             )
 
                             _section("Clients")
-                            with dpg.group(horizontal=True):
-                                _btn("▶  Install Client",
-                                     lambda: _bg(op_install_client),
-                                     BTN_W, t_cyan)
-                                dpg.add_spacer(width=8)
-                                _btn("☕  Java Client",
-                                     lambda: _bg(op_install_java_client),
-                                     BTN_W, t_yellow)
+                            _btn("▶  Install Client",
+                                 lambda: _bg(op_install_client),
+                                 BTN_W, t_cyan)
                             dpg.add_spacer(height=3)
                             dpg.add_text(
-                                "Java client requires Java 17+  —  https://adoptium.net",
-                                color=C_YELLOW,
+                                "Downloads the 2004sp native client for your platform.",
+                                color=C_DIM,
                             )
 
-                            _section("Content & Update")
+                            _section("Content, Update & Setup")
                             with dpg.group(horizontal=True):
                                 _btn("+  Extra Content",
                                      lambda: _bg(op_extra_content),
@@ -1053,15 +1139,31 @@ def build_ui() -> None:
                                      BTN_W, t_cyan)
                             dpg.add_spacer(height=4)
                             dpg.add_text(
-                                "Update pulls latest commits, reinstalls deps, then prompts\n"
-                                "for client, Java client, and extra content updates.",
+                                "Update pulls the latest commits, reinstalls deps, then prompts\n"
+                                "for client and extra content updates.",
                                 color=C_DIM,
                             )
+                            dpg.add_spacer(height=8)
+                            _btn("⚙  Setup (interactive)",
+                                 lambda: _bg(launch_npm, "setup"),
+                                 BTN_W, t_magenta)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text("Setup opens in a new terminal window.", color=C_DIM)
 
                     # ── LAUNCH TAB ────────────────────────────────────────────
                     with dpg.tab(label="   Launch   "):
                         with dpg.child_window(width=content_w, height=TAB_CONTENT_H,
                                               border=False):
+                            _section("Client")
+                            _btn("▶  Launch 2004sp Client",
+                                 lambda: _bg(op_launch_client),
+                                 BTN_W, t_green)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text(
+                                "Launches the installed 2004sp client from the install directory.",
+                                color=C_DIM,
+                            )
+
                             _section("Server")
                             with dpg.group(horizontal=True):
                                 _btn("▶  Start Server",
@@ -1081,7 +1183,6 @@ def build_ui() -> None:
                                 _btn("⟳  Dev Mode",
                                      lambda: _bg(launch_npm, "dev"),
                                      BTN_W, t_cyan)
-
 
                             _section("Services")
                             with dpg.group(horizontal=True):
@@ -1115,13 +1216,6 @@ def build_ui() -> None:
                                 _btn("🗑  Clean",
                                      lambda: _bg(launch_npm, "clean"),
                                      BTN_W, t_red)
-                            dpg.add_spacer(height=6)
-                            _btn("⚙  Setup (interactive)",
-                                 lambda: _bg(launch_npm, "setup"),
-                                 BTN_W, t_magenta)
-                            dpg.add_spacer(height=4)
-                            dpg.add_text("Setup opens in a new terminal window.",
-                                         color=C_DIM)
 
                     # ── TOOLS TAB ─────────────────────────────────────────────
                     with dpg.tab(label="   Tools   "):
@@ -1169,6 +1263,42 @@ def build_ui() -> None:
                             )
                             dpg.add_spacer(height=6)
                             _btn("Change Password", _cb_change_pw, BTN_W, t_magenta)
+
+                    # ── RESOURCES TAB ─────────────────────────────────────────
+                    with dpg.tab(label="   Resources   "):
+                        with dpg.child_window(width=content_w, height=TAB_CONTENT_H,
+                                              border=False):
+                            _section("2004sp")
+                            dpg.add_text("Official Website", color=C_TEXT)
+                            _link_btn("🌐  www.2004sp.cc",
+                                      "https://www.2004sp.cc/",
+                                      content_w - 24, t_cyan)
+                            dpg.add_spacer(height=8)
+                            dpg.add_text("Community Forum", color=C_TEXT)
+                            _link_btn("💬  forum.2004sp.cc",
+                                      "https://forum.2004sp.cc/",
+                                      content_w - 24, t_cyan)
+
+                            _section("GitHub")
+                            _link_btn("🐙  github.com/2004sp",
+                                      "https://github.com/2004sp",
+                                      content_w - 24, t_cyan)
+
+                            _section("Java Client")
+                            dpg.add_text(
+                                "The Progressive Java Client runs in any browser-independent environment.\n"
+                                "Requires Java 17 or newer.",
+                                color=C_DIM, wrap=content_w - 24,
+                            )
+                            dpg.add_spacer(height=6)
+                            _link_btn("☕  Progressive Java Client — Releases",
+                                      "https://github.com/2004sp/Progressive-Java-Client/releases",
+                                      content_w - 24, t_yellow)
+                            dpg.add_spacer(height=8)
+                            dpg.add_text("Need Java 17+?", color=C_TEXT)
+                            _link_btn("☕  adoptium.net  (Eclipse Temurin)",
+                                      "https://adoptium.net",
+                                      content_w - 24, t_yellow)
 
                 # ── Log panel ─────────────────────────────────────────────────
                 dpg.add_spacer(height=6)
@@ -1232,6 +1362,9 @@ def main() -> None:
 
     log(f"{APP_TITLE} v{APP_VERSION} ready.", "ok")
     log("Set your install directory in the sidebar, then choose an action.", "info")
+
+    # Fetch progressive branches in the background — combo updates via _ui_updates queue
+    _bg(_fetch_progressive_branches)
 
     while dpg.is_dearpygui_running():
         _render()
