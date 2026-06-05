@@ -63,7 +63,7 @@ jobs:
             --collect-all dearpygui `
             --add-data "logo.png${{ matrix.add_data_sep }}." `
             --name "${{ matrix.artifact_name }}" `
-            --icon "logo.png" `
+            --icon "icon.ico" `
             launcher.py
 
       - name: Build executable (Linux / macOS)
