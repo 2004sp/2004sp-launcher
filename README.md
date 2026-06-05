@@ -1,6 +1,6 @@
 # 2004sp Launcher
 
-A graphical installer and server manager for **LostCity RS 254 + Progressive Bots**.
+A graphical installer and server manager for **LostCity RS 254 + 2004sp**.
 
 ![2004sp Launcher](screenshot.png)
 
@@ -11,7 +11,7 @@ A graphical installer and server manager for **LostCity RS 254 + Progressive Bot
 The launcher replaces the old batch/script-based setup with a single GUI that handles everything:
 
 **Install tab**
-- Clones and installs the LostCity RS 254 server (Engine-TS, Content, Server repos) on either the `stable` (main) or `dev` branch
+- Clones and installs the LostCity RS 254 server (Engine-TS, Content, Server repos) on either the `stable` (main) or `dev` branch + the 2004sp modifcation
 - Downloads the 2004sp native client for your platform (Windows/macOS/Linux)
 - Downloads the Progressive Java Client (`.jar`)
 - Installs extra content (additional items, capes, etc.)
