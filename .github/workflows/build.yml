@@ -1,0 +1,91 @@
+name: Build Native Executables
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: 2004scape-launcher-windows.exe
+            asset_name:    2004scape-launcher-windows.exe
+            add_data_sep:  ";"
+
+          - os: ubuntu-latest
+            artifact_name: 2004scape-launcher-linux
+            asset_name:    2004scape-launcher-linux
+            add_data_sep:  ":"
+            apt_deps: >-
+              libgl1-mesa-glx
+              libglib2.0-0
+              libfontconfig1
+              libx11-6
+              libxext6
+              libxrender1
+
+          - os: macos-latest
+            artifact_name: 2004scape-launcher-macos
+            asset_name:    2004scape-launcher-macos
+            add_data_sep:  ":"
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ${{ matrix.apt_deps }}
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build executable (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller `
+            --onefile `
+            --windowed `
+            --collect-all dearpygui `
+            --add-data "logo.png${{ matrix.add_data_sep }}." `
+            --name "${{ matrix.artifact_name }}" `
+            --icon "logo.png" `
+            launcher.py
+
+      - name: Build executable (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller \
+            --onefile \
+            --collect-all dearpygui \
+            --add-data "logo.png${{ matrix.add_data_sep }}." \
+            --name "${{ matrix.artifact_name }}" \
+            launcher.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.artifact_name }}
+          generate_release_notes: true
