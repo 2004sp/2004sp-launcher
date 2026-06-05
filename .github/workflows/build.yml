@@ -6,6 +6,9 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -22,7 +25,7 @@ jobs:
             asset_name:    2004scape-launcher-linux
             add_data_sep:  ":"
             apt_deps: >-
-              libgl1-mesa-glx
+              libgl1
               libglib2.0-0
               libfontconfig1
               libx11-6
