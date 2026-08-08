@@ -46,11 +46,16 @@ REPO_ENGINE           = "https://github.com/LostCityRS/Engine-TS.git"
 REPO_CONTENT          = "https://github.com/LostCityRS/Content.git"
 REPO_SERVER           = "https://github.com/LostCityRS/Server.git"
 REPO_PROGRESSIVE      = "https://github.com/2004sp/2004sp-progressive.git"
-REPO_EXTRAS           = "https://github.com/2004sp/2004sp-extras.git"
 CLIENT_API            = "https://api.github.com/repos/2004sp/2004sp-client/releases/latest"
 PROGRESSIVE_BRANCHES_API = "https://api.github.com/repos/2004sp/2004sp-progressive/branches"
 
 INSTALL_DIR_DEFAULT = _launcher_dir() / "lostcity254"
+
+CUSTOM_CONTENT_PREFIXES = {
+    "NODE_FEATURE_": "Features",
+    "NODE_QOL_":     "QOL (Quality of Life)",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Color palette
@@ -318,6 +323,43 @@ def check_prereqs() -> dict:
             log(f"{tool}: NOT FOUND", "err")
     return result
 
+def get_env_value(key: str) -> bool:
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        return False
+    env_path = engine_dir / ".env"
+    if not env_path.exists():
+        return False
+    content = env_path.read_text("utf-8")
+    match = re.search(
+        rf"^#?\s*{re.escape(key)}\s*=\s*(true|false)\s*$",
+        content, re.MULTILINE | re.IGNORECASE,
+    )
+    return match.group(1).lower() == "true" if match else False
+
+def _parse_custom_content(env_path: Path) -> dict[str, list[tuple[str, str, bool]]]:
+    """
+    Read env_path and return {category: [(display_name, key, enabled)]}.
+    Picks up any NODE_FEATURE_* or NODE_QOL_* key automatically.
+    """
+    categories: dict[str, list] = {}
+    if not env_path.exists():
+        return categories
+    for line in env_path.read_text("utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, raw = line.partition("=")
+        key = key.strip()
+        enabled = raw.strip().lower() == "true"
+        for prefix, cat in CUSTOM_CONTENT_PREFIXES.items():
+            if key.startswith(prefix):
+                suffix  = key[len(prefix):]
+                display = suffix.replace("_", " ").title()
+                categories.setdefault(cat, []).append((display, key, enabled))
+                break
+    return categories
+
 def get_engine_dir() -> Path | None:
     with _state_lock:
         ed = _state.get("engine_dir")
@@ -557,24 +599,6 @@ def op_install_server(branch: str) -> None:
 def op_install_client() -> None:
     _do_client_install(Path(_state["install_dir"]))
 
-def _do_extra_content(install_dir: Path) -> None:
-    log("── Extra Content ──", "step")
-    if not install_dir.exists():
-        log("No install found. Run Install first.", "err")
-        return
-    extras_tmp = install_dir / "_extras_tmp"
-    if git_clone_or_pull(REPO_EXTRAS, extras_tmp):
-        extras_content = extras_tmp / "content"
-        if extras_content.exists():
-            overlay_files(extras_content, install_dir / "content")
-        env_path = install_dir / "engine" / ".env"
-        if env_path.exists():
-            patch_env(env_path, {"NODE_CLIENT_ROUTEFINDER": "false", "BUILD_VERIFY": "false"})
-    log("── Extra Content Complete ──", "ok")
-
-def op_extra_content() -> None:
-    _do_extra_content(Path(_state["install_dir"]))
-
 def op_install_all(branch: str) -> None:
     install_dir = Path(_state["install_dir"])
     log(f"── Install All  branch={branch} ──", "step")
@@ -587,12 +611,6 @@ def op_install_all(branch: str) -> None:
         _do_client_install(install_dir)
     else:
         log("Skipping client install.", "info")
-
-    if _confirm("Install Extra Content? (additional items, capes, etc.)",
-                "Extra Content"):
-        _do_extra_content(install_dir)
-    else:
-        log("Skipping extra content.", "info")
 
     log("── Install All Complete ──", "ok")
 
@@ -644,11 +662,6 @@ def op_update_server(branch: str) -> None:
     else:
         log("Skipping client update.", "info")
 
-    if _confirm("Update Extra Content too?", "Update Extra Content"):
-        _do_extra_content(install_dir)
-    else:
-        log("Skipping extra content update.", "info")
-
     log("── Update Complete ──", "ok")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -656,17 +669,129 @@ def op_update_server(branch: str) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 NPM_SCRIPTS: dict = {
-    "start":      ("Start Server",         None),   # new terminal
-    "quickstart": ("Quickstart",           None),   # new terminal
-    "dev":        ("Dev Mode",             None),   # new terminal
-    "friend":     ("Friend Server",        None),   # new terminal
-    "logger":     ("Logger",               None),   # new terminal
-    "login":      ("Login Server",         None),   # new terminal
-    "hiscores":   ("Hiscores",             True),   # background, tracked
-    "build":      ("Build",                False),  # tracked (exits when done)
-    "clean":      ("Clean",                False),  # tracked (exits when done)
-    "setup":      ("Setup (interactive)",  None),   # new terminal
+    "start":      ("Start Server",  None),   # new terminal
+    "quickstart": ("Quickstart",    None),   # new terminal
+    "dev":        ("Dev Mode",      None),   # new terminal
+    "friend":     ("Friend Server", None),   # new terminal
+    "logger":     ("Logger",        None),   # new terminal
+    "login":      ("Login Server",  None),   # new terminal
+    "hiscores":   ("Hiscores",      True),   # background, tracked
+    "build":      ("Build",         False),  # tracked (exits when done)
+    "clean":      ("Clean",         False),  # tracked (exits when done)
+    "setup":      ("Setup",         None),   # new terminal (interactive)
 }
+
+def op_launch_engine() -> None:
+    """Run npx tsx launcher.ts in the engine directory (matches start.bat)."""
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found — check install dir in sidebar.", "err")
+        return
+    if not (engine_dir / "launcher.ts").exists():
+        log("engine/launcher.ts not found — install server first.", "err")
+        return
+    log("Launching engine via npx tsx launcher.ts...", "step")
+    _open_new_terminal(["npx", "tsx", "launcher.ts"], engine_dir)
+
+def op_toggle_feature(key: str, enabled: bool) -> None:
+    """Write a single custom content feature flag to engine/.env."""
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found.", "err")
+        return
+    env_path = engine_dir / ".env"
+    if not env_path.exists():
+        log(".env not found — install server first.", "err")
+        return
+    patch_env(env_path, {key: "true" if enabled else "false"})
+
+def op_set_all_features(enabled: bool) -> None:
+    """Enable or disable all custom content features in engine/.env."""
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found.", "err")
+        return
+    env_path = engine_dir / ".env"
+    if not env_path.exists():
+        log(".env not found — install server first.", "err")
+        return
+    categories = _parse_custom_content(env_path)
+    patches = {
+        key: "true" if enabled else "false"
+        for features in categories.values()
+        for _, key, _ in features
+    }
+    if patches:
+        patch_env(env_path, patches)
+
+def op_custom_server() -> None:
+    """Patch .env → build → delete script.dat → start (matches launcher.ts option 2)."""
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found.", "err")
+        return
+    env_path = engine_dir / ".env"
+    if not env_path.exists():
+        log(".env not found — install server first.", "err")
+        return
+    log("── Custom Server ──", "step")
+    patch_env(env_path, {"NODE_CLIENT_ROUTEFINDER": "false", "BUILD_VERIFY": "false"})
+    log("Building content...", "step")
+    rc = stream_cmd(["npm", "run", "build"], engine_dir)
+    if rc != 0:
+        log("Build failed — server not started.", "err")
+        return
+    script_dat = engine_dir / "data" / "pack" / "server" / "script.dat"
+    if script_dat.exists():
+        script_dat.unlink()
+        log("Deleted data/pack/server/script.dat", "ok")
+    log("Starting server...", "step")
+    _open_new_terminal(["npm", "run", "quickstart"], engine_dir)
+
+def op_build_webclient() -> None:
+    """bun install → bun run build → copy client.js into engine/public/client."""
+    install_dir = Path(_state["install_dir"])
+    engine_dir  = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found.", "err")
+        return
+    webclient_dir = install_dir / "webclient"
+    if not webclient_dir.exists():
+        log(f"webclient folder not found: {webclient_dir}", "err")
+        return
+    log("── Build Web Client ──", "step")
+    if not (webclient_dir / "node_modules" / "terser").exists():
+        log("Installing webclient dependencies (bun install)...", "step")
+        rc = stream_cmd(["bun", "install"], webclient_dir)
+        if rc != 0:
+            log("bun install failed — make sure bun is installed and on PATH.", "err")
+            return
+    log("Building webclient (bun run build)...", "step")
+    rc = stream_cmd(["bun", "run", "build"], webclient_dir)
+    if rc != 0:
+        log("Webclient build failed.", "err")
+        return
+    src  = webclient_dir / "out" / "client.js"
+    dest = engine_dir / "public" / "client" / "client.js"
+    if not src.exists():
+        log(f"Build output not found: {src}", "err")
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(str(src), str(dest))
+    log("Copied client.js → engine/public/client/client.js", "ok")
+    log("── Web Client Build Complete ──", "ok")
+
+def op_patch_env_offline() -> None:
+    """Disable routefinder and build verify in .env (offline single-player mode)."""
+    engine_dir = get_engine_dir()
+    if not engine_dir:
+        log("Engine dir not found — check install dir in sidebar.", "err")
+        return
+    env_path = engine_dir / ".env"
+    if not env_path.exists():
+        log(".env not found — install server first.", "err")
+        return
+    patch_env(env_path, {"NODE_CLIENT_ROUTEFINDER": "false", "BUILD_VERIFY": "false"})
 
 def launch_npm(name: str) -> None:
     engine_dir = get_engine_dir()
@@ -1114,7 +1239,7 @@ def build_ui() -> None:
                                      BTN_W, t_green)
                             dpg.add_spacer(height=4)
                             dpg.add_text(
-                                "Install All prompts you for client and extra content.",
+                                "Install All prompts you to download the client.",
                                 color=C_DIM,
                             )
 
@@ -1128,27 +1253,16 @@ def build_ui() -> None:
                                 color=C_DIM,
                             )
 
-                            _section("Content, Update & Setup")
-                            with dpg.group(horizontal=True):
-                                _btn("+  Extra Content",
-                                     lambda: _bg(op_extra_content),
-                                     BTN_W, t_magenta)
-                                dpg.add_spacer(width=8)
-                                _btn("↺  Update",
-                                     lambda: _bg(op_update_server, _branch()),
-                                     BTN_W, t_cyan)
+                            _section("Update")
+                            _btn("↺  Update",
+                                 lambda: _bg(op_update_server, _branch()),
+                                 BTN_W, t_cyan)
                             dpg.add_spacer(height=4)
                             dpg.add_text(
-                                "Update pulls the latest commits, reinstalls deps, then prompts\n"
-                                "for client and extra content updates.",
+                                "Pulls the latest commits, reinstalls deps, then prompts\n"
+                                "for a client update.",
                                 color=C_DIM,
                             )
-                            dpg.add_spacer(height=8)
-                            _btn("⚙  Setup (interactive)",
-                                 lambda: _bg(launch_npm, "setup"),
-                                 BTN_W, t_magenta)
-                            dpg.add_spacer(height=3)
-                            dpg.add_text("Setup opens in a new terminal window.", color=C_DIM)
 
                     # ── LAUNCH TAB ────────────────────────────────────────────
                     with dpg.tab(label="   Launch   "):
@@ -1164,25 +1278,25 @@ def build_ui() -> None:
                                 color=C_DIM,
                             )
 
-                            _section("Server")
+                            _section("Play")
+                            _btn("★  Start Server + Hiscores  [Recommended]",
+                                 lambda: (_bg(launch_npm, "hiscores"),
+                                          _bg(launch_npm, "quickstart")),
+                                 BTN_W + 100, t_green)
+                            dpg.add_spacer(height=6)
                             with dpg.group(horizontal=True):
                                 _btn("▶  Start Server",
                                      lambda: _bg(launch_npm, "start"),
-                                     BTN_W, t_green)
-                                dpg.add_spacer(width=8)
-                                _btn("⚡  Quickstart",
-                                     lambda: _bg(launch_npm, "quickstart"),
                                      BTN_W, t_cyan)
-                            dpg.add_spacer(height=6)
-                            with dpg.group(horizontal=True):
-                                _btn("★  Server + Hiscores",
-                                     lambda: (_bg(launch_npm, "start"),
-                                              _bg(launch_npm, "hiscores")),
-                                     BTN_W, t_green)
                                 dpg.add_spacer(width=8)
-                                _btn("⟳  Dev Mode",
-                                     lambda: _bg(launch_npm, "dev"),
-                                     BTN_W, t_cyan)
+                                _btn("⚙  Custom Server",
+                                     lambda: _bg(op_custom_server),
+                                     BTN_W, t_magenta)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text(
+                                "Custom Server: patch .env → build → delete script.dat → start.",
+                                color=C_DIM,
+                            )
 
                             _section("Services")
                             with dpg.group(horizontal=True):
@@ -1209,24 +1323,54 @@ def build_ui() -> None:
 
                             _section("Build & Maintenance")
                             with dpg.group(horizontal=True):
-                                _btn("⚙  Build",
+                                _btn("⟳  Dev Mode",
+                                     lambda: _bg(launch_npm, "dev"),
+                                     BTN_W, t_cyan)
+                                dpg.add_spacer(width=8)
+                                _btn("⚙  Build Content",
                                      lambda: _bg(launch_npm, "build"),
                                      BTN_W, t_magenta)
-                                dpg.add_spacer(width=8)
-                                _btn("🗑  Clean",
+                            dpg.add_spacer(height=6)
+                            with dpg.group(horizontal=True):
+                                _btn("🗑  Clean Build Files",
                                      lambda: _bg(launch_npm, "clean"),
                                      BTN_W, t_red)
+                                dpg.add_spacer(width=8)
+                                _btn("⚙  Setup",
+                                     lambda: _bg(launch_npm, "setup"),
+                                     BTN_W, t_magenta)
+                            dpg.add_spacer(height=6)
+                            _btn("🌐  Build Web Client",
+                                 lambda: _bg(op_build_webclient),
+                                 BTN_W, t_cyan)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text(
+                                "bun install → bun run build → copy into engine/public/client/.",
+                                color=C_DIM,
+                            )
 
                     # ── TOOLS TAB ─────────────────────────────────────────────
                     with dpg.tab(label="   Tools   "):
                         with dpg.child_window(width=content_w, height=TAB_CONTENT_H,
                                               border=False):
+                            _section("Custom Content  (modular plugin system)")
+                            _btn("⚙  Custom Content",
+                                 _cb_open_custom_content,
+                                 BTN_W, t_yellow)
+                            dpg.add_spacer(height=3)
+                            dpg.add_text(
+                                "Toggle optional features — writes directly to engine/.env.",
+                                color=C_DIM,
+                            )
+
                             _section("Environment Config")
-                            _btn("Patch .env", _cb_patch_env, BTN_W, t_cyan)
+                            _btn("Patch .env  (offline mode)",
+                                 lambda: _bg(op_patch_env_offline),
+                                 BTN_W, t_cyan)
                             dpg.add_spacer(height=3)
                             dpg.add_text(
                                 "Sets NODE_CLIENT_ROUTEFINDER=false and BUILD_VERIFY=false\n"
-                                "in engine/.env — required for offline single-player mode.",
+                                "in engine/.env — required for offline / Custom Server mode.",
                                 color=C_DIM,
                             )
 
@@ -1318,16 +1462,85 @@ def build_ui() -> None:
 #  Tool callbacks (defined after build_ui to avoid forward-ref issues)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _cb_patch_env() -> None:
+def _cb_feature_toggle(sender, value, user_data) -> None:
+    _bg(op_toggle_feature, user_data, value)
+
+def _cb_open_custom_content() -> None:
     engine_dir = get_engine_dir()
     if not engine_dir:
-        log("Engine dir not found — check install dir in sidebar.", "err")
+        log("Engine dir not found — install server first.", "err")
         return
     env_path = engine_dir / ".env"
-    if not env_path.exists():
-        log(".env not found — install server first.", "err")
+    categories = _parse_custom_content(env_path)
+    if not categories:
+        log("No custom content features found in engine/.env.", "warn")
         return
-    _bg(patch_env, env_path, {"NODE_CLIENT_ROUTEFINDER": "false", "BUILD_VERIFY": "false"})
+
+    modal_tag = "cc_modal"
+    if dpg.does_item_exist(modal_tag):
+        dpg.delete_item(modal_tag)
+
+    t_green = _btn_theme((28,65,28,255), (45,95,45,255),  (65,130,65,255), C_GREEN)
+    t_red   = _btn_theme((75,22,22,255), (105,38,38,255), (140,55,55,255), C_RED)
+    t_dim   = _btn_theme((35,35,50,255), (50,50,70,255),  (65,65,90,255),  C_DIM)
+
+    # collect all feature keys visible in this modal for enable/disable all
+    all_keys = [key for feats in categories.values() for _, key, _ in feats]
+
+    with dpg.window(label="Custom Content", modal=True, tag=modal_tag,
+                    no_resize=True, width=680,
+                    pos=[WIN_W // 2 - 340, WIN_H // 2 - 260]):
+        dpg.add_text(
+            "Toggle features — changes write to engine/.env immediately.",
+            color=C_DIM, wrap=656,
+        )
+        dpg.add_spacer(height=10)
+
+        for cat_name, features in categories.items():
+            dpg.add_text(cat_name, color=C_YELLOW)
+            dpg.add_separator()
+            dpg.add_spacer(height=4)
+            with dpg.group(horizontal=True):
+                dpg.add_spacer(width=14)
+                with dpg.group():
+                    for display, key, enabled in features:
+                        dpg.add_checkbox(
+                            label=display,
+                            tag=f"cc_{key}",
+                            default_value=enabled,
+                            callback=_cb_feature_toggle,
+                            user_data=key,
+                        )
+            dpg.add_spacer(height=10)
+
+        dpg.add_separator()
+        dpg.add_spacer(height=8)
+
+        def _enable_all():
+            _bg(op_set_all_features, True)
+            for key in all_keys:
+                if dpg.does_item_exist(f"cc_{key}"):
+                    dpg.set_value(f"cc_{key}", True)
+
+        def _disable_all():
+            _bg(op_set_all_features, False)
+            for key in all_keys:
+                if dpg.does_item_exist(f"cc_{key}"):
+                    dpg.set_value(f"cc_{key}", False)
+
+        with dpg.group(horizontal=True):
+            b_ea = dpg.add_button(label="Enable All",  width=120, height=30, callback=_enable_all)
+            dpg.bind_item_theme(b_ea, t_green)
+            dpg.add_spacer(width=6)
+            b_da = dpg.add_button(label="Disable All", width=120, height=30, callback=_disable_all)
+            dpg.bind_item_theme(b_da, t_red)
+            dpg.add_spacer(width=6)
+            b_cl = dpg.add_button(
+                label="Close", width=80, height=30,
+                callback=lambda: dpg.delete_item(modal_tag),
+            )
+            dpg.bind_item_theme(b_cl, t_dim)
+        dpg.add_spacer(height=4)
 
 def _cb_import_char() -> None:
     user = dpg.get_value("import_user")
@@ -1338,6 +1551,7 @@ def _cb_change_pw() -> None:
     user = dpg.get_value("chpw_user")
     pw   = dpg.get_value("chpw_pass")
     _bg(tool_change_password, user, pw)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  Entry point
